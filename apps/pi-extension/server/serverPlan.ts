@@ -472,6 +472,7 @@ export async function startPlanReviewServer(options: {
 		stop: () => {
 			aiRuntime?.dispose();
 			server.close();
+			server.closeAllConnections();
 		},
 	};
 }

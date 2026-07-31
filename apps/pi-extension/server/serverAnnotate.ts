@@ -860,6 +860,7 @@ export async function startAnnotateServer(options: {
 			aiRuntime?.dispose();
 			agentTerminal.dispose();
 			server.close();
+			server.closeAllConnections();
 		},
 	};
 }

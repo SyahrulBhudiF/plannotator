@@ -2758,6 +2758,7 @@ export async function startReviewServer(options: {
 			agentJobs.killAll();
 			aiRuntime?.dispose();
 			server.close();
+			server.closeAllConnections();
 			// Invoke cleanup callback (e.g., remove temp worktree)
 			if (options.onCleanup) {
 				try {

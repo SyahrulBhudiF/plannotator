@@ -30,6 +30,13 @@ export function openPlanReviewBrowser(
 	return loadPlannotatorBrowser().then((browser) => browser.openPlanReviewBrowser(...args));
 }
 
+/** Stop every active browser session owned by this extension process. */
+export function stopAllBrowserDecisionSessions(): void {
+	void loadPlannotatorBrowser()
+		.then((browser) => browser.stopAllBrowserDecisionSessions())
+		.catch(() => {});
+}
+
 /** Start a code-review browser session after loading the browser/server graph on demand. */
 export function startCodeReviewBrowserSession(
 	...args: Parameters<PlannotatorBrowserModule["startCodeReviewBrowserSession"]>

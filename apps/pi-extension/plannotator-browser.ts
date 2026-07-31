@@ -85,6 +85,11 @@ type CodeReviewDecision = {
 };
 
 const CODE_REVIEW_PROGRESS_STATUS = "plannotator-review";
+const activeBrowserSessionStops = new Set<() => void>();
+
+export function stopAllBrowserDecisionSessions(): void {
+	for (const stop of [...activeBrowserSessionStops]) stop();
+}
 
 function setCodeReviewProgress(ctx: ExtensionContext, message?: string): void {
 	ctx.ui.setStatus(
@@ -151,10 +156,11 @@ async function waitForDecisionWithCleanup<T>(
 	}
 }
 
-function startBrowserDecisionSession<T>(
+export function startBrowserDecisionSession<T>(
 	server: { url: string; stop: () => void },
 	ctx: ExtensionContext,
 	waitForResult: () => Promise<T>,
+	signal?: AbortSignal,
 ): BrowserDecisionSession<T> {
 	// Fire-and-forget so the caller's turn is not blocked on a browser launch.
 	// Nothing may escape: an unhandled rejection here — a launcher that failed,
@@ -172,10 +178,15 @@ function startBrowserDecisionSession<T>(
 	const stop = () => {
 		if (stopped) return;
 		stopped = true;
+		activeBrowserSessionStops.delete(stop);
+		signal?.removeEventListener("abort", stop);
 		server.stop();
 		stopReject?.(createStoppedError());
 		stopReject = undefined;
 	};
+	activeBrowserSessionStops.add(stop);
+	if (signal?.aborted) stop();
+	else signal?.addEventListener("abort", stop, { once: true });
 
 	return {
 		url: server.url,
@@ -204,6 +215,7 @@ function startBrowserDecisionSession<T>(
 export async function startPlanReviewBrowserSession(
 	ctx: ExtensionContext,
 	planContent: string,
+	signal?: AbortSignal,
 ): Promise<PlanReviewBrowserSession> {
 	if (!ctx.hasUI) {
 		throw new Error("Plannotator browser review is unavailable in this session.");
@@ -222,7 +234,7 @@ export async function startPlanReviewBrowserSession(
 		pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
 	});
 
-	const session = startBrowserDecisionSession(server, ctx, server.waitForDecision);
+	const session = startBrowserDecisionSession(server, ctx, server.waitForDecision, signal);
 	server.onDecision(() => {
 		setTimeout(() => session.stop(), 1500);
 	});
@@ -237,8 +249,9 @@ export async function startPlanReviewBrowserSession(
 export async function openPlanReviewBrowser(
 	ctx: ExtensionContext,
 	planContent: string,
+	signal?: AbortSignal,
 ): Promise<PlanReviewDecision> {
-	const session = await startPlanReviewBrowserSession(ctx, planContent);
+	const session = await startPlanReviewBrowserSession(ctx, planContent, signal);
 	return session.waitForDecision();
 }
 
