@@ -2758,7 +2758,12 @@ export async function startReviewServer(options: {
 			agentJobs.killAll();
 			aiRuntime?.dispose();
 			server.close();
-			server.closeAllConnections();
+			// close() only stops the listener; drain browser keep-alive sockets so a
+			// stopped session's connections die immediately instead of at the
+			// browser's whim (parity with Bun's server.stop(), which closes idle
+			// connections). Guarded: jiti can run under hosts whose node:http lacks
+			// closeAllConnections.
+			server.closeAllConnections?.();
 			// Invoke cleanup callback (e.g., remove temp worktree)
 			if (options.onCleanup) {
 				try {

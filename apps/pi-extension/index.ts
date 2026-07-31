@@ -165,6 +165,13 @@ function sessionOpenedMessage(label: string, url: string): string {
 function reportBackgroundError(ctx: ExtensionContext, message: string, err: unknown, origin?: PiSessionIdentity): void {
 	const detail = getStartupErrorMessage(err);
 	console.error(`${message}: ${detail}`);
+	// A stopped session is not a failure: it is how supersession ends a stale
+	// undecided session (port self-preemption, #1159) and how cancel paths
+	// settle a pending waitForDecision.
+	if (detail.includes("browser session was stopped")) {
+		safeNotify(ctx, "Previous Plannotator browser session was closed.", "info", origin);
+		return;
+	}
 	safeNotify(ctx, `${message}: ${detail}`, "error", origin);
 }
 

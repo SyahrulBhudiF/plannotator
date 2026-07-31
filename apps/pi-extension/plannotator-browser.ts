@@ -107,6 +107,38 @@ function delay(ms: number): Promise<void> {
 	return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
+// Both fixed-port bind failures from listenOnPort: a single busy port and an
+// exhausted explicit range.
+const PORT_IN_USE_PATTERN = /\bPort \d+ in use\b|\bPort selection .+ exhausted\b/;
+
+// A fixed-port session (remote mode) abandoned without a decision keeps its
+// server listening forever in this long-lived pi process, so the next
+// command's bind fails (#1159). Live tracked sessions are the only thing
+// self-preemption may stop; returns whether anything was stopped.
+function stopTrackedBrowserSessions(): boolean {
+	if (activeBrowserSessionStops.size === 0) return false;
+	stopAllBrowserDecisionSessions();
+	return true;
+}
+
+export async function startServerWithSelfPreemption<T>(
+	start: () => Promise<T>,
+	stopPrevious: () => boolean = stopTrackedBrowserSessions,
+): Promise<T> {
+	try {
+		return await start();
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		if (!PORT_IN_USE_PATTERN.test(message) || !stopPrevious()) throw err;
+		// A fresh command is the user asking for a new review surface, so stale
+		// same-process sessions lose the port. Random-port local sessions never
+		// collide, so concurrent local sessions are untouched; a port held by
+		// another process still fails after the retry.
+		await delay(150);
+		return await start();
+	}
+}
+
 async function openBrowserForServer(serverUrl: string, ctx: ExtensionContext): Promise<void> {
 	const browserResult = await openBrowser(serverUrl);
 	if (isRemoteSession()) {
@@ -225,14 +257,14 @@ export async function startPlanReviewBrowserSession(
 		throw new Error("Plannotator browser review is unavailable in this session.");
 	}
 
-	const server = await startPlanReviewServer({
+	const server = await startServerWithSelfPreemption(() => startPlanReviewServer({
 		plan: planContent,
 		htmlContent: planHtmlContent,
 		origin: "pi",
 		sharingEnabled: resolveSharingEnabled(loadConfig()),
 		shareBaseUrl: process.env.PLANNOTATOR_SHARE_URL || undefined,
 		pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
-	});
+	}));
 
 	const session = startBrowserDecisionSession(server, ctx, server.waitForDecision, signal);
 	server.onDecision(() => {
@@ -519,7 +551,7 @@ async function createCodeReviewBrowserSession(
 		}
 	}
 
-	const server = await startReviewServer({
+	const server = await startServerWithSelfPreemption(() => startReviewServer({
 		rawPatch,
 		gitRef,
 		error: diffError,
@@ -538,7 +570,7 @@ async function createCodeReviewBrowserSession(
 		shareBaseUrl: process.env.PLANNOTATOR_SHARE_URL || undefined,
 		pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
 		onCleanup: worktreeCleanup,
-	});
+	}));
 
 	return startBrowserDecisionSession(server, ctx, server.waitForDecision);
 }
@@ -600,7 +632,7 @@ export async function startMarkdownAnnotationSession(
 		}
 	}
 
-	const server = await startAnnotateServer({
+	const server = await startServerWithSelfPreemption(() => startAnnotateServer({
 		markdown: resolvedMarkdown,
 		filePath,
 		origin: "pi",
@@ -621,7 +653,7 @@ export async function startMarkdownAnnotationSession(
 		pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
 		agentCwd: ctx.cwd,
 		project: detectProjectName(),
-	});
+	}));
 
 	return startBrowserDecisionSession(server, ctx, server.waitForDecision);
 }
@@ -670,7 +702,7 @@ export async function openArchiveBrowserAction(
 		throw new Error("Plannotator archive browser is unavailable in this session.");
 	}
 
-	const server = await startPlanReviewServer({
+	const server = await startServerWithSelfPreemption(() => startPlanReviewServer({
 		plan: "",
 		htmlContent: planHtmlContent,
 		origin: "pi",
@@ -679,7 +711,7 @@ export async function openArchiveBrowserAction(
 		sharingEnabled: resolveSharingEnabled(loadConfig()),
 		shareBaseUrl: process.env.PLANNOTATOR_SHARE_URL || undefined,
 		pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
-	});
+	}));
 
 	return openBrowserAndWait(server, ctx, async () => {
 		if (server.waitForDone) {
