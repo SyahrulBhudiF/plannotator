@@ -42,7 +42,6 @@ import {
 	startLastMessageAnnotationSession,
 	startMarkdownAnnotationSession,
 	openPlanReviewBrowser,
-	stopAllBrowserDecisionSessions,
 	PLANNOTATOR_PLAN_APPROVED_CHANNEL,
 	type PlannotatorPlanApprovedEvent,
 	registerPlannotatorEventListeners,
@@ -74,6 +73,7 @@ import {
 	stripPlanningOnlyTools,
 } from "./tool-scope.ts";
 import { isRemoteSession } from "./server/network.ts";
+import { isBrowserSessionStoppedError } from "./browser-session-error.ts";
 import { classifyAnnotateOutcome } from "./annotate-outcome.ts";
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -168,8 +168,8 @@ function reportBackgroundError(ctx: ExtensionContext, message: string, err: unkn
 	// A stopped session is not a failure: it is how supersession ends a stale
 	// undecided session (port self-preemption, #1159) and how cancel paths
 	// settle a pending waitForDecision.
-	if (detail.includes("browser session was stopped")) {
-		safeNotify(ctx, "Previous Plannotator browser session was closed.", "info", origin);
+	if (isBrowserSessionStoppedError(err)) {
+		safeNotify(ctx, "A Plannotator browser session was closed.", "info", origin);
 		return;
 	}
 	safeNotify(ctx, `${message}: ${detail}`, "error", origin);
@@ -294,7 +294,11 @@ export default function plannotator(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", () => {
 		sessionAlive = false;
 		currentPiSession.clear();
-		stopAllBrowserDecisionSessions();
+		// Browser sessions deliberately outlive in-process session replacement so
+		// a tab opened before /new can still deliver feedback to the replacement
+		// session (withCurrentPiSessionFallbackHeader). On real process teardown
+		// the OS frees the ports, and port self-preemption reclaims any stale
+		// fixed-port session on the next command.
 	});
 
 	// ── Flags ────────────────────────────────────────────────────────────
@@ -1077,6 +1081,20 @@ export default function plannotator(pi: ExtensionAPI): void {
 			try {
 				result = await openPlanReviewBrowser(ctx, planContent, signal);
 			} catch (err) {
+				// A stopped session is an outcome, not a startup failure: the review
+				// was closed (cancellation or port self-preemption) before a decision.
+				if (isBrowserSessionStoppedError(err)) {
+					ctx.ui.notify("Plan review session was closed before a decision.", "info");
+					return {
+						content: [
+							{
+								type: "text",
+								text: "The plan review browser session was closed before a decision was made. The plan was neither approved nor rejected; resubmit to reopen review.",
+							},
+						],
+						details: { approved: false },
+					};
+				}
 				const message = `Failed to start plan review UI: ${getStartupErrorMessage(err)}`;
 				ctx.ui.notify(message, "error");
 				return {
