@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import type { Origin } from '@plannotator/core/agents';
 import type { DiffLineBgIntensity } from '@plannotator/core/config-types';
 import { configStore, useConfigValue, setReviewPanelView, setReviewDefaultDiffType } from '../config';
-import { loadDiffFont } from '../utils/diffFonts';
+
 import { TaterSpritePullup } from './TaterSpritePullup';
 import { getIdentity, regenerateIdentity, setCustomIdentity, isIdentityEditable } from '../utils/identity';
 import { GitUser } from '../icons/GitUser';
@@ -104,19 +104,6 @@ interface SettingsProps {
 }
 
 // --- Review-mode Display tab (diff display options) ---
-
-const DIFF_FONT_OPTIONS = [
-  { value: '', label: 'Theme Default' },
-  { value: 'Fira Code', label: 'Fira Code' },
-  { value: 'Hack', label: 'Hack' },
-  { value: 'IBM Plex Mono', label: 'IBM Plex Mono' },
-  { value: 'Inconsolata', label: 'Inconsolata' },
-  { value: 'JetBrains Mono', label: 'JetBrains Mono' },
-  { value: 'Red Hat Mono', label: 'Red Hat Mono' },
-  { value: 'Roboto Mono', label: 'Roboto Mono' },
-  { value: 'Source Code Pro', label: 'Source Code Pro' },
-  { value: 'Atkinson Hyperlegible Mono', label: 'Atkinson Hyperlegible' },
-];
 
 export const DIFF_STYLE_OPTIONS = [
   { value: 'split' as const, label: 'Split' },
@@ -436,13 +423,7 @@ const ReviewDisplayTab: React.FC<{ isCompactTouchLayout?: boolean }> = ({ isComp
   const diffHideWhitespace = useConfigValue('diffHideWhitespace');
   const editSuggestions = useConfigValue('editSuggestions');
   const diffExpandUnchanged = useConfigValue('diffExpandUnchanged');
-  const diffFontFamily = useConfigValue('diffFontFamily');
   const diffFontSize = useConfigValue('diffFontSize');
-
-  // Load font for the preview swatch
-  useEffect(() => {
-    if (diffFontFamily) loadDiffFont(diffFontFamily);
-  }, [diffFontFamily]);
 
   return (
     <>
@@ -459,33 +440,6 @@ const ReviewDisplayTab: React.FC<{ isCompactTouchLayout?: boolean }> = ({ isComp
         />
       </div>
 
-      <div className="border-t border-border" />
-
-      {/* Font Family */}
-      <div className="space-y-2">
-        <div>
-          <div className="text-sm font-medium">Code Font</div>
-          <div className="text-xs text-muted-foreground">Font family for diff code lines</div>
-        </div>
-        <select
-          value={diffFontFamily}
-          onChange={(e) => configStore.set('diffFontFamily', e.target.value)}
-          className="w-full px-3 py-1.5 text-sm rounded-md bg-muted/50 border border-border text-foreground"
-          style={diffFontFamily ? { fontFamily: `'${diffFontFamily}', monospace` } : undefined}
-        >
-          {DIFF_FONT_OPTIONS.map((opt) => (
-            <option key={opt.value} value={opt.value}>{opt.label}</option>
-          ))}
-        </select>
-        {diffFontFamily && (
-          <div
-            className="text-xs text-muted-foreground px-1 py-1 rounded bg-muted/30 font-mono"
-            style={{ fontFamily: `'${diffFontFamily}', monospace` }}
-          >
-            Preview: const x = fn(42);
-          </div>
-        )}
-      </div>
 
       <div className="border-t border-border" />
 
@@ -1412,7 +1366,7 @@ export const Settings: React.FC<SettingsProps> = ({ taterMode, onTaterModeChange
                 )}
 
                 {/* === THEME TAB === */}
-                {activeTab === 'theme' && <ThemeTab onPreview={() => { setShowDialog(false); setThemePreview(true); }} />}
+                {activeTab === 'theme' && <ThemeTab typographySurface={mode === 'review' ? 'review' : mode === 'annotate' ? 'annotate' : 'plan'} onPreview={() => { setShowDialog(false); setThemePreview(true); }} />}
 
                 {/* === GIT TAB === */}
                 {activeTab === 'git' && mode === 'review' && (

@@ -41,7 +41,7 @@ import {
 } from "./integrations.ts";
 import { buildAdvertisedUrl, listenOnPort } from "./network.ts";
 
-import { loadConfig, saveConfig, detectGitUser, getServerConfig, resolveAIEnabled, resolveSharingEnabled } from "../generated/config.ts";
+import { loadConfig, saveConfig, detectGitUser, getServerConfig, parseTypographyConfig, resolveAIEnabled, resolveSharingEnabled } from "../generated/config.ts";
 import { readImprovementHook, getImprovementHookExpectedPath } from "../generated/improvement-hooks.ts";
 import { composeImproveContext } from "../generated/pfm-reminder.ts";
 import { detectProjectName, getRepoInfo } from "./project.ts";
@@ -257,11 +257,16 @@ export async function startPlanReviewServer(options: {
 			});
 		} else if (url.pathname === "/api/config" && req.method === "POST") {
 			try {
-				const body = (await parseBody(req)) as { displayName?: string; diffOptions?: Record<string, unknown>; theme?: Record<string, unknown>; conventionalComments?: boolean; conventionalLabels?: unknown[] | null; pfmReminder?: boolean };
+				const body = (await parseBody(req)) as { displayName?: string; diffOptions?: Record<string, unknown>; theme?: Record<string, unknown>; typography?: Record<string, unknown>; conventionalComments?: boolean; conventionalLabels?: unknown[] | null; pfmReminder?: boolean };
 				const toSave: Record<string, unknown> = {};
 				if (body.displayName !== undefined) toSave.displayName = body.displayName;
 				if (body.diffOptions !== undefined) toSave.diffOptions = body.diffOptions;
 				if (body.theme !== undefined) toSave.theme = body.theme;
+				if (body.typography !== undefined) {
+					const typography = parseTypographyConfig(body.typography);
+					if (!typography.ok) return json(res, { error: "Invalid typography" }, 400);
+					toSave.typography = typography.value;
+				}
 				if (body.conventionalComments !== undefined) toSave.conventionalComments = body.conventionalComments;
 				if (body.conventionalLabels !== undefined) toSave.conventionalLabels = body.conventionalLabels;
 				if (body.pfmReminder !== undefined) toSave.pfmReminder = body.pfmReminder;

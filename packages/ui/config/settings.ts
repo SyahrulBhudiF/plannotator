@@ -9,7 +9,7 @@
  * Add new settings here. Cookie-only settings omit serverKey.
  */
 
-import type { DiffLineBgIntensity } from '@plannotator/core/config-types';
+import { parseTypographyConfig, type DiffLineBgIntensity, type TypographyConfig } from '@plannotator/core/config-types';
 import { storage } from '../utils/storage';
 import { generateIdentity } from '../utils/generateIdentity';
 import {
@@ -130,6 +130,25 @@ export const SETTINGS = {
       return normalizeThemePair(theme, getDefaultThemePair());
     },
     toServer: (v: ThemePair) => ({ theme: { mode: v.mode, light: v.light, dark: v.dark } }),
+  },
+
+  typography: {
+    defaultValue: {} as TypographyConfig,
+    fromCookie: () => {
+      const raw = storage.getItem('plannotator-typography');
+      if (!raw) return undefined;
+      try {
+        const parsed = parseTypographyConfig(JSON.parse(raw));
+        return parsed.ok ? parsed.value : undefined;
+      } catch { return undefined; }
+    },
+    toCookie: (value: TypographyConfig) => storage.setItem('plannotator-typography', JSON.stringify(value)),
+    serverKey: 'typography',
+    fromServer: (sc: Record<string, unknown>) => {
+      const parsed = parseTypographyConfig(sc.typography);
+      return parsed.ok ? parsed.value : undefined;
+    },
+    toServer: (value: TypographyConfig) => ({ typography: value }),
   },
 
   gridEnabled: {
