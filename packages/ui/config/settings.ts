@@ -10,6 +10,7 @@
  */
 
 import { parseTypographyConfig, type DiffLineBgIntensity, type TypographyConfig } from '@plannotator/core/config-types';
+import { isFaviconStyle, type FaviconStyle } from '@plannotator/core/favicon';
 import { storage } from '../utils/storage';
 import { generateIdentity } from '../utils/generateIdentity';
 import {
@@ -130,6 +131,20 @@ export const SETTINGS = {
       return normalizeThemePair(theme, getDefaultThemePair());
     },
     toServer: (v: ThemePair) => ({ theme: { mode: v.mode, light: v.light, dark: v.dark } }),
+  },
+  faviconStyle: {
+    defaultValue: 'totman' as FaviconStyle,
+    fromCookie: () => {
+      const v = storage.getItem('plannotator-favicon');
+      return isFaviconStyle(v) ? v : undefined;
+    },
+    toCookie: (v: FaviconStyle) => storage.setItem('plannotator-favicon', v),
+    serverKey: 'favicon',
+    fromServer: (sc: Record<string, unknown>) => {
+      const v = sc.favicon;
+      return isFaviconStyle(v) ? v : undefined;
+    },
+    toServer: (v: FaviconStyle) => ({ favicon: v }),
   },
 
   typography: {

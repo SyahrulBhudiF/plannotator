@@ -4764,14 +4764,14 @@ const App: React.FC = () => {
   const browserCanvas = isHtmlSurface || gridEnabled ? 'background' : 'card';
   if (isLoading && !isSharedSession) {
     return (
-      <ThemeProvider defaultTheme="dark">
+      <ThemeProvider defaultTheme="dark" manageFavicon>
         <div className="pn-app-viewport bg-background" />
       </ThemeProvider>
     );
   }
 
   return (
-    <ThemeProvider defaultTheme="dark">
+    <ThemeProvider defaultTheme="dark" manageFavicon>
       <TooltipProvider delayDuration={900} skipDelayDuration={200} disableHoverableContent>
       <div
         data-print-region="root"

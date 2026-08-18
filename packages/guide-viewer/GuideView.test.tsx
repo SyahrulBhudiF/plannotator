@@ -1,19 +1,18 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import type { CodeGuideData } from '@plannotator/shared/guide';
-import type { DiffFile } from '../../types';
-import { ReviewStateProvider, type ReviewState } from '../../dock/ReviewStateContext';
+import type { CodeGuideData } from '@plannotator/core/guide';
+import type { DiffFile } from './types';
+import { GuideHostProvider, type GuideHostValue } from './host';
 
 let latestCodeViewProps: Record<string, unknown>[] = [];
-mock.module('../AllFilesCodeView', () => ({
-  AllFilesCodeView: (props: Record<string, unknown>) => {
-    latestCodeViewProps.push(props);
-    const files = props.files as DiffFile[];
-    return <div data-testid="file-code-view" data-file={files[0]?.path} />;
-  },
-}));
-const { GuideView, resolveGuideSectionFiles } = await import('./GuideView');
+/** Stand-in diff renderer: records the props the guide chain hands it. */
+function FakeDiffRenderer(props: Record<string, unknown>) {
+  latestCodeViewProps.push(props);
+  const files = props.files as DiffFile[];
+  return <div data-testid="file-code-view" data-file={files[0]?.path} />;
+}
+import { GuideView, resolveGuideSectionFiles } from './GuideView';
 
 const hasDom = typeof document !== 'undefined';
 
@@ -68,15 +67,26 @@ function makeFile(path: string): DiffFile {
   };
 }
 
-function makeState(overrides: Partial<ReviewState> = {}): ReviewState {
+type HostOverrides = {
+  files?: DiffFile[];
+  guideRevealFile?: { path: string; token: number } | null;
+  onGuideRevealFile?: (path: string) => void;
+  allFilesActiveSearchMatch?: { id: string; filePath: string } | null;
+  [passthrough: string]: unknown;
+};
+
+/** Build a GuideHost value: known host fields map onto the contract, anything else is forwarded to the renderer. */
+function makeState(overrides: HostOverrides = {}): GuideHostValue<Record<string, unknown>> {
+  const { files = [], guideRevealFile = null, onGuideRevealFile, allFilesActiveSearchMatch = null, ...passthrough } = overrides;
   return {
-    files: [],
-    guideRevealFile: null,
-    allFilesActiveSearchMatch: null,
-    aiMessages: [],
-    onClickAIMarker: () => {},
-    ...overrides,
-  } as unknown as ReviewState;
+    files,
+    DiffRenderer: FakeDiffRenderer as unknown as GuideHostValue<Record<string, unknown>>['DiffRenderer'],
+    // Mirrors the in-app host, which also forwards the active match to the renderer.
+    getDiffRendererProps: () => ({ ...passthrough, activeSearchMatch: allFilesActiveSearchMatch }),
+    revealFile: guideRevealFile,
+    onRevealFile: onGuideRevealFile,
+    activeSearchMatch: allFilesActiveSearchMatch,
+  };
 }
 
 let root: Root | null = null;
@@ -97,7 +107,7 @@ async function renderView(
   guide: CodeGuideData,
   options: {
     onRegenerate?: () => void;
-    state?: ReviewState;
+    state?: GuideHostValue<Record<string, unknown>>;
     onFocusFile?: (path: string) => void;
   } = {},
 ) {
@@ -108,7 +118,7 @@ async function renderView(
       options.onFocusFile?.(path);
     }, [options.onFocusFile]);
     return (
-      <ReviewStateProvider value={options.state ?? makeState()}>
+      <GuideHostProvider value={options.state ?? makeState()}>
         <GuideView
           guide={guide}
           reviewed={guide.reviewed}
@@ -117,10 +127,13 @@ async function renderView(
           onFocusFile={handleFocusFile}
           onRegenerate={options.onRegenerate}
         />
-      </ReviewStateProvider>
+      </GuideHostProvider>
     );
   };
 
+  // A second render inside one test replaces the previous tree instead of leaking it into document.body.
+  if (root !== null) await act(async () => root?.unmount());
+  host?.remove();
   host = document.createElement('div');
   document.body.appendChild(host);
   await act(async () => {
@@ -148,13 +161,11 @@ describe('resolveGuideSectionFiles', () => {
 });
 
 describe('GuideView persistence affordances (#1112)', () => {
-  test.skipIf(!hasDom)('renders no Saved chip and no outdated hint by default', async () => {
+  test.skipIf(!hasDom)('renders the Saved chip only when persisted, and no outdated hint either way', async () => {
     await renderView(makeGuide());
     expect(host!.textContent).not.toContain('Saved');
     expect(host!.textContent).not.toContain('Generated on a different version');
-  });
 
-  test.skipIf(!hasDom)('renders the Saved chip when the guide is persisted', async () => {
     await renderView(makeGuide({ saved: true }));
     expect(host!.textContent).toContain('Saved');
     expect(host!.textContent).not.toContain('Generated on a different version');
@@ -233,7 +244,7 @@ describe('GuideView per-file windowing', () => {
 
     await act(async () => {
       root!.render(
-        <ReviewStateProvider value={makeState({ files, guideRevealFile: { path: 'a.ts', token: 1 } })}>
+        <GuideHostProvider value={makeState({ files, guideRevealFile: { path: 'a.ts', token: 1 } })}>
           <GuideView
             guide={guide}
             reviewed={guide.reviewed}
@@ -241,7 +252,7 @@ describe('GuideView per-file windowing', () => {
             focusedFile={null}
             onFocusFile={() => {}}
           />
-        </ReviewStateProvider>,
+        </GuideHostProvider>,
       );
     });
     expect(host!.querySelectorAll('[data-testid="file-code-view"]')).toHaveLength(1);

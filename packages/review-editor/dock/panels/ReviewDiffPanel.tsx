@@ -89,6 +89,7 @@ export const ReviewDiffPanel: React.FC<IDockviewPanelProps> = (props) => {
         selectedAnnotationId={state.selectedAnnotationId}
         scrollTargetAnnotation={state.scrollTargetAnnotation}
         pendingSelection={state.pendingSelection}
+        compactTouchLayout={state.isCompactTouchLayout}
         onLineSelection={state.onLineSelection}
         onAddAnnotation={state.onAddAnnotation}
         onAddFileComment={state.onAddFileComment}
@@ -96,6 +97,7 @@ export const ReviewDiffPanel: React.FC<IDockviewPanelProps> = (props) => {
         onSelectAnnotation={state.onSelectAnnotation}
         onDeleteAnnotation={state.onDeleteAnnotation}
         isViewed={state.viewedFiles.has(file.path)}
+        isGenerated={state.generatedFiles.has(file.path)}
         onToggleViewed={() => state.onToggleViewed(file.path)}
         showViewedControls={state.showViewedControls}
         isStaged={state.stagedFiles.has(file.path)}

@@ -1,10 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { CodeGuideData, GuideSection } from '@plannotator/shared/guide';
-import type { DiffFile } from '../../types';
-import { useReviewState } from '../../dock/ReviewStateContext';
-import { renderInlineMarkdown } from '../../utils/renderInlineMarkdown';
+import type { CodeGuideData, GuideSection } from '@plannotator/core/guide';
+import type { DiffFile } from './types';
+import { useGuideHost } from './host';
+import { renderInlineMarkdown } from './renderInlineMarkdown';
 import { GuideSectionCard } from './GuideSectionCard';
-import { GuideViewportProvider } from './GuideViewportManager';
+import { GUIDE_EAGER_MOUNT_MAX_FILES, GuideViewportProvider } from './GuideViewportManager';
 
 interface GuideViewProps {
   guide: CodeGuideData;
@@ -16,6 +16,10 @@ interface GuideViewProps {
   onFocusFile: (filePath: string) => void;
   /** Launch a fresh guide when a persisted guide no longer matches this branch. */
   onRegenerate?: () => void;
+  /** Extra provenance line under the counts (portable exports: repo, PR link, changeset). */
+  sourceLine?: React.ReactNode;
+  /** Host-provided controls rendered top-right of the header (in-app: the export button). */
+  headerActions?: React.ReactNode;
 }
 
 export interface ResolvedGuideSections {
@@ -64,9 +68,13 @@ export const GuideView: React.FC<GuideViewProps> = ({
   focusedFile,
   onFocusFile,
   onRegenerate,
+  sourceLine,
+  headerActions,
 }) => {
-  const state = useReviewState();
-  const resolved = useMemo(() => resolveGuideSectionFiles(guide, state.files), [guide, state.files]);
+  const host = useGuideHost();
+  const resolved = useMemo(() => resolveGuideSectionFiles(guide, host.files), [guide, host.files]);
+  // Only the guide's own files register shells; in-app the review may hold many more.
+  const guideFileCount = resolved.sectionFiles.reduce((n, files) => n + files.length, 0) + resolved.unplacedFiles.length;
   const hasUnplaced = (guide.unplacedFiles?.length ?? 0) > 0;
   const cardTotal = guide.sections.length + (hasUnplaced ? 1 : 0);
   const reviewedCount = reviewed.filter(Boolean).length;
@@ -77,8 +85,8 @@ export const GuideView: React.FC<GuideViewProps> = ({
 
   const localRevealTokenRef = useRef(0);
   const [localRevealTarget, setLocalRevealTarget] = useState<{ filePath: string; token: number } | null>(null);
-  const externalRevealTarget = state.guideRevealFile
-    ? { filePath: state.guideRevealFile.path, token: state.guideRevealFile.token }
+  const externalRevealTarget = host.revealFile
+    ? { filePath: host.revealFile.path, token: host.revealFile.token }
     : null;
   const revealTarget = externalRevealTarget ?? localRevealTarget;
 
@@ -92,21 +100,21 @@ export const GuideView: React.FC<GuideViewProps> = ({
   const handleRequestReveal = useCallback(
     (filePath: string) => {
       onFocusFile(filePath);
-      if (state.onGuideRevealFile) {
-        state.onGuideRevealFile(filePath);
+      if (host.onRevealFile) {
+        host.onRevealFile(filePath);
       } else {
         localRevealTokenRef.current += 1;
         setLocalRevealTarget({ filePath, token: localRevealTokenRef.current });
       }
     },
-    [onFocusFile, state.onGuideRevealFile],
+    [onFocusFile, host.onRevealFile],
   );
 
   // Search results are global to the review, but an offscreen guide file has no
   // CodeView to receive the active match. Route each match change through the
   // same reveal channel as outline/sidebar jumps so its chapter opens, its shell
   // mounts, and the target viewer becomes active before line navigation runs.
-  const activeSearchMatch = state.allFilesActiveSearchMatch;
+  const activeSearchMatch = host.activeSearchMatch;
   useEffect(() => {
     if (!activeSearchMatch) return;
     handleRequestReveal(activeSearchMatch.filePath);
@@ -125,7 +133,9 @@ export const GuideView: React.FC<GuideViewProps> = ({
   );
 
   return (
-    <GuideViewportProvider className="w-full px-10 py-8">
+    <GuideViewportProvider className="w-full px-3 py-5 sm:px-6 sm:py-6 lg:px-10 lg:py-8" eager={guideFileCount <= GUIDE_EAGER_MOUNT_MAX_FILES}>
+      {/* Header actions sit in a row above the title on narrow screens and float beside it from md up (desktop unchanged). */}
+      {headerActions && <div className="mb-3 flex items-center justify-end gap-2 md:float-right md:mb-0 md:ml-6">{headerActions}</div>}
       <div className="max-w-[72ch]">
         <h1 className="text-[22px] font-semibold tracking-tight text-foreground [text-wrap:balance]">{guide.title}</h1>
         {guide.intent && (
@@ -146,6 +156,9 @@ export const GuideView: React.FC<GuideViewProps> = ({
             </span>
           )}
         </p>
+        {sourceLine && (
+          <p className="mt-1.5 font-mono text-[11px] text-muted-foreground/60">{sourceLine}</p>
+        )}
         {guide.moved && (
           <p className="mt-1.5 font-mono text-[11px] text-muted-foreground/50">
             Generated on a different version of this branch

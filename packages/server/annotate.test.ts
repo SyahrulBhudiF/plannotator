@@ -19,6 +19,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpath
 import { tmpdir } from "os";
 import { join, resolve } from "path";
 import { startAnnotateServer } from "./annotate";
+import { getServerConfig, loadConfig } from "./config";
 import { deriveAnnotateHistorySlug } from "@plannotator/shared/annotate-history";
 import { getPlannotatorDataDir } from "@plannotator/shared/data-dir";
 
@@ -82,6 +83,64 @@ describe("annotate server: /api/save-notes wiring", () => {
       const response = await fetch(`${server.url}/not-a-real-route`);
       expect(response.headers.get("content-type")).toContain("text/html");
       expect(await response.text()).toContain("Plannotator");
+    } finally {
+      server.stop();
+    }
+  });
+});
+
+describe("annotate server: /api/config favicon persistence", () => {
+  let savedPort: string | undefined;
+  let savedRemote: string | undefined;
+  let savedDataDir: string | undefined;
+  let tempDir: string;
+
+  beforeEach(() => {
+    savedPort = process.env.PLANNOTATOR_PORT;
+    savedRemote = process.env.PLANNOTATOR_REMOTE;
+    savedDataDir = process.env.PLANNOTATOR_DATA_DIR;
+    delete process.env.PLANNOTATOR_PORT;
+    delete process.env.PLANNOTATOR_REMOTE;
+    tempDir = mkdtempSync(join(tmpdir(), "plannotator-annotate-config-test-"));
+    process.env.PLANNOTATOR_DATA_DIR = tempDir;
+  });
+
+  afterEach(() => {
+    if (savedPort === undefined) delete process.env.PLANNOTATOR_PORT;
+    else process.env.PLANNOTATOR_PORT = savedPort;
+    if (savedRemote === undefined) delete process.env.PLANNOTATOR_REMOTE;
+    else process.env.PLANNOTATOR_REMOTE = savedRemote;
+    if (savedDataDir === undefined) delete process.env.PLANNOTATOR_DATA_DIR;
+    else process.env.PLANNOTATOR_DATA_DIR = savedDataDir;
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  test("persists classic favicon via POST /api/config and ignores unknown values", async () => {
+    const server = await startAnnotateServer({
+      markdown: "# Test",
+      filePath: join(tmpdir(), "test.md"),
+      htmlContent: MINIMAL_HTML,
+    });
+
+    try {
+      const validResponse = await fetch(`${server.url}/api/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ favicon: "classic" }),
+      });
+      expect(validResponse.status).toBe(200);
+      expect(loadConfig().favicon).toBe("classic");
+      expect(getServerConfig(null).favicon).toBe("classic");
+
+      const invalidResponse = await fetch(`${server.url}/api/config`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ favicon: "unknown" }),
+      });
+      expect(invalidResponse.status).toBe(200);
+      // "unknown" was not written into config, so "classic" is retained
+      expect(loadConfig().favicon).toBe("classic");
+      expect(getServerConfig(null).favicon).toBe("classic");
     } finally {
       server.stop();
     }

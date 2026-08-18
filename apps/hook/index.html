@@ -4,7 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Plannotator</title>
-    <link rel="icon" type="image/png" sizes="64x64" href="/favicon.png">
+    <!-- No type/sizes: /favicon.png is served by the Plannotator server, which
+         picks the bytes from the persisted favicon style, so the response
+         Content-Type is the only truthful declaration. See handleFavicon(). -->
+    <link rel="icon" href="/favicon.png">
 
   </head>
   <body class="overflow-hidden overscroll-none antialiased">

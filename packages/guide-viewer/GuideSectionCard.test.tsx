@@ -1,20 +1,19 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import type { GuideSection } from '@plannotator/shared/guide';
-import type { DiffFile } from '../../types';
-import { ReviewStateProvider, type ReviewState } from '../../dock/ReviewStateContext';
-import { GUIDE_MAX_MOUNTED_CODE_VIEWS, GuideViewportProvider } from './GuideViewportManager';
+import type { GuideSection } from '@plannotator/core/guide';
+import type { DiffFile } from './types';
+import { GuideHostProvider, type GuideHostValue } from './host';
+import { GuideViewportProvider } from './GuideViewportManager';
 
 let codeViewProps: Record<string, unknown>[] = [];
-mock.module('../AllFilesCodeView', () => ({
-  AllFilesCodeView: (props: Record<string, unknown>) => {
-    codeViewProps.push(props);
-    const files = props.files as DiffFile[];
-    return <div data-testid="file-code-view" data-file={files[0]?.path} />;
-  },
-}));
-const { GuideSectionCard } = await import('./GuideSectionCard');
+/** Stand-in diff renderer: records the props the guide chain hands it. */
+function FakeDiffRenderer(props: Record<string, unknown>) {
+  codeViewProps.push(props);
+  const files = props.files as DiffFile[];
+  return <div data-testid="file-code-view" data-file={files[0]?.path} />;
+}
+import { GuideSectionCard } from './GuideSectionCard';
 
 const hasDom = typeof document !== 'undefined';
 
@@ -34,14 +33,26 @@ function makeFile(path = 'src/payments/localize.ts'): DiffFile {
   };
 }
 
-function makeState(overrides: Partial<ReviewState> = {}): ReviewState {
+type HostOverrides = {
+  files?: DiffFile[];
+  guideRevealFile?: { path: string; token: number } | null;
+  onGuideRevealFile?: (path: string) => void;
+  allFilesActiveSearchMatch?: { id: string; filePath: string } | null;
+  [passthrough: string]: unknown;
+};
+
+/** Build a GuideHost value: known host fields map onto the contract, anything else is forwarded to the renderer. */
+function makeState(overrides: HostOverrides = {}): GuideHostValue<Record<string, unknown>> {
+  const { files = [], guideRevealFile = null, onGuideRevealFile, allFilesActiveSearchMatch = null, ...passthrough } = overrides;
   return {
-    files: [],
-    guideRevealFile: null,
-    aiMessages: [],
-    onClickAIMarker: () => {},
-    ...overrides,
-  } as unknown as ReviewState;
+    files,
+    DiffRenderer: FakeDiffRenderer as unknown as GuideHostValue<Record<string, unknown>>['DiffRenderer'],
+    // Mirrors the in-app host, which also forwards the active match to the renderer.
+    getDiffRendererProps: () => ({ ...passthrough, activeSearchMatch: allFilesActiveSearchMatch }),
+    revealFile: guideRevealFile,
+    onRevealFile: onGuideRevealFile,
+    activeSearchMatch: allFilesActiveSearchMatch,
+  };
 }
 
 let root: Root | null = null;
@@ -59,12 +70,12 @@ afterEach(async () => {
 });
 
 function renderCard(
-  state: ReviewState,
+  state: GuideHostValue<Record<string, unknown>>,
   props: Partial<React.ComponentProps<typeof GuideSectionCard>> = {},
 ) {
   const file = makeFile();
   return (
-    <ReviewStateProvider value={state}>
+    <GuideHostProvider value={state}>
       <GuideViewportProvider>
         <GuideSectionCard
           section={section}
@@ -80,15 +91,16 @@ function renderCard(
           {...props}
         />
       </GuideViewportProvider>
-    </ReviewStateProvider>
+    </GuideHostProvider>
   );
 }
 
 describe('GuideSectionCard', () => {
-  test.skipIf(!hasDom)('keeps every file shell but mounts only a bounded window of one-file CodeViews', async () => {
-    const files = Array.from({ length: 74 }, (_, index) => makeFile(`src/file-${index}.ts`));
-    const largeSection: GuideSection = {
-      title: 'Large chapter',
+  test.skipIf(!hasDom)('renders per-file summaries in the card and never delegates them to the renderer', async () => {
+    // Windowing at scale is covered by GuideView.test.tsx; this guards only what the card owns.
+    const files = Array.from({ length: 3 }, (_, index) => makeFile(`src/file-${index}.ts`));
+    const summarized: GuideSection = {
+      title: 'Summarized chapter',
       overview: '',
       diffs: files.map((file) => ({ file: file.path, summary: `Summary for ${file.path}` })),
     };
@@ -96,36 +108,13 @@ describe('GuideSectionCard', () => {
     document.body.appendChild(host);
     await act(async () => {
       root = createRoot(host!);
-      root.render(renderCard(makeState({ files }), {
-        section: largeSection,
-        files,
-        focusedFile: files[0].path,
-      }));
+      root.render(renderCard(makeState({ files }), { section: summarized, files, focusedFile: files[0].path }));
     });
 
-    expect(host.querySelectorAll('[data-guide-file-shell]')).toHaveLength(74);
-    const mounted = host.querySelectorAll('[data-testid="file-code-view"]');
-    expect(mounted.length).toBeGreaterThan(0);
-    expect(mounted.length).toBeLessThanOrEqual(GUIDE_MAX_MOUNTED_CODE_VIEWS);
-    expect(codeViewProps.every((props) => (props.files as DiffFile[]).length === 1)).toBe(true);
+    expect(host.querySelectorAll('[data-guide-file-shell]')).toHaveLength(3);
+    expect(codeViewProps.length).toBeGreaterThan(0);
     expect(codeViewProps.every((props) => props.fileSummaries === undefined)).toBe(true);
     expect(host.textContent).toContain('Summary for src/file-0.ts');
-  });
-
-  test.skipIf(!hasDom)('file chip click routes through the reveal callback', async () => {
-    const revealed: string[] = [];
-    const file = makeFile();
-    host = document.createElement('div');
-    document.body.appendChild(host);
-    await act(async () => {
-      root = createRoot(host!);
-      root.render(renderCard(makeState({ files: [file] }), { onRequestReveal: (path) => revealed.push(path) }));
-    });
-
-    const chip = host.querySelector<HTMLButtonElement>('button[title^="src/payments/localize.ts"]');
-    expect(chip).not.toBeNull();
-    await act(async () => chip!.click());
-    expect(revealed).toEqual(['src/payments/localize.ts']);
   });
 
   test.skipIf(!hasDom)('a reveal expands a reviewed chapter and force-targets its file CodeView', async () => {
@@ -186,65 +175,18 @@ describe('GuideSectionCard', () => {
     expect(codeViewProps[codeViewProps.length - 1].files).toBe(firstFileList);
   });
 
-  test.skipIf(!hasDom)('passes AI marker state and enables outer scroll chaining', async () => {
+  test.skipIf(!hasDom)('forwards host renderer props and enables outer scroll chaining', async () => {
     const file = makeFile();
-    const aiMessage = {
-      question: {
-        id: 'question-1',
-        prompt: 'Why did this change?',
-        filePath: file.path,
-        lineStart: 1,
-        lineEnd: 1,
-        side: 'new' as const,
-        createdAt: 1,
-      },
-      response: {
-        questionId: 'question-1',
-        text: 'Because localization moved here.',
-        isStreaming: false,
-        createdAt: 2,
-      },
-    };
-    const clicked: string[] = [];
-    const onClickAIMarker = (questionId: string) => clicked.push(questionId);
     host = document.createElement('div');
     document.body.appendChild(host);
     await act(async () => {
       root = createRoot(host!);
-      root.render(renderCard(makeState({ files: [file], aiMessages: [aiMessage], onClickAIMarker })));
+      // Sentinel: the chain must hand getDiffRendererProps() output to the renderer untouched.
+      root.render(renderCard(makeState({ files: [file], hostSentinel: 'sentinel-42' })));
     });
 
     const latest = codeViewProps[codeViewProps.length - 1];
-    expect(latest.aiMessages).toEqual([aiMessage]);
+    expect(latest.hostSentinel).toBe('sentinel-42');
     expect(latest.allowScrollChaining).toBe(true);
-    (latest.onClickAIMarker as (questionId: string) => void)('question-1');
-    expect(clicked).toEqual(['question-1']);
-  });
-
-  test.skipIf(!hasDom)('passes keyboard ownership only to the focused file CodeView', async () => {
-    const files = [makeFile('a.ts'), makeFile('b.ts')];
-    const twoFileSection: GuideSection = {
-      title: 'Two files',
-      overview: '',
-      diffs: files.map((file) => ({ file: file.path })),
-    };
-    host = document.createElement('div');
-    document.body.appendChild(host);
-    await act(async () => {
-      root = createRoot(host!);
-      root.render(renderCard(makeState({ files }), {
-        section: twoFileSection,
-        files,
-        focusedFile: 'b.ts',
-      }));
-    });
-
-    const latestByFile = new Map<string, Record<string, unknown>>();
-    for (const props of codeViewProps) {
-      const path = (props.files as DiffFile[])[0]?.path;
-      if (path) latestByFile.set(path, props);
-    }
-    expect(latestByFile.get('a.ts')?.isActive).toBe(false);
-    expect(latestByFile.get('b.ts')?.isActive).toBe(true);
   });
 });

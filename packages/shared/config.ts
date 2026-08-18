@@ -11,8 +11,9 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
 import { execSync } from "child_process";
 
 import { parseTypographyConfig, type DefaultDiffType, type DiffLineBgIntensity, type DiffOptions, type ThemeConfig, type TypographyConfig } from '@plannotator/core/config-types';
+import { isFaviconStyle, type FaviconStyle } from './favicon';
 export { parseTypographyConfig };
-export type { DefaultDiffType, DiffLineBgIntensity, DiffOptions, ThemeConfig, TypographyConfig };
+export type { DefaultDiffType, DiffLineBgIntensity, DiffOptions, ThemeConfig, TypographyConfig, FaviconStyle };
 
 /** Single conventional comment label entry stored in config.json */
 export interface CCLabelConfig {
@@ -188,6 +189,15 @@ export interface PlannotatorConfig {
    */
   share?: "enabled" | "disabled";
   /**
+   * Base URL of the guide host that `plannotator guide share` and the
+   * in-app "Create share link" upload Guided Reviews to (default
+   * https://guides.show; a self-hosted `apps/guides-show` origin otherwise).
+   * Must be http(s); a trailing slash is trimmed. Mirrors the
+   * PLANNOTATOR_GUIDE_SHARE_URL env var, which takes precedence. Guide sharing
+   * is off entirely while `share` is "disabled".
+   */
+  guideShareUrl?: string;
+  /**
    * Pass `--sandbox enabled` when launching Cursor's `agent` CLI for review
    * jobs. When true (default), review jobs run with Cursor's sandbox forced
    * on as part of their read-only posture. Set to false on systems where
@@ -221,6 +231,11 @@ export interface PlannotatorConfig {
    * never read back. Failures are non-fatal.
    */
   todoProvider?: "auto" | "off";
+  /**
+   * Selected favicon style for Plannotator application surfaces:
+   * 'totman' (production brand mascot) or 'classic' (historical dark-navy P tile).
+   */
+  favicon?: FaviconStyle;
 }
 
 /** Parse the only server-writable call-review analysis flags. */
@@ -329,6 +344,7 @@ export function getServerConfig(gitUser: string | null): {
   diffOptions?: DiffOptions;
   theme?: ThemeConfig;
   typography?: TypographyConfig;
+  favicon?: FaviconStyle;
   reviewAnalysis: NonNullable<PlannotatorConfig["reviewAnalysis"]>;
   gitUser?: string;
   conventionalComments?: boolean;
@@ -341,6 +357,7 @@ export function getServerConfig(gitUser: string | null): {
     diffOptions: cfg.diffOptions,
     ...(cfg.theme !== undefined && { theme: cfg.theme }),
     ...(typography.ok && { typography: typography.value }),
+    ...(isFaviconStyle(cfg.favicon) && { favicon: cfg.favicon }),
     // These values gate server-side work, so always make the resolved defaults
     // explicit. The client must not revive a stale cookie that disagrees with
     // the server when the config leaves either optional leaf unset.
@@ -449,11 +466,59 @@ export function resolveUseJina(cliNoJina: boolean, config: PlannotatorConfig): b
  * Priority (highest wins):
  *   PLANNOTATOR_SHARE env var  →  config.share  →  default true
  */
-export function resolveSharingEnabled(config: PlannotatorConfig): boolean {
-  const envVal = process.env.PLANNOTATOR_SHARE;
+export function resolveSharingEnabled(config: PlannotatorConfig, env: NodeJS.ProcessEnv = process.env): boolean {
+  const envVal = env.PLANNOTATOR_SHARE;
   if (envVal !== undefined) return envVal !== "disabled";
   if (config.share !== undefined) return config.share !== "disabled";
   return true;
+}
+
+/** Where shared Guided Reviews are uploaded by default (guide share hosting contract, §7). */
+export const DEFAULT_GUIDE_SHARE_URL = "https://guides.show";
+
+/**
+ * Validate and normalize a guide share service URL: http(s) only, credentials,
+ * query and fragment dropped, trailing slashes trimmed so callers can append
+ * `/api/g`. Null when the value must not be used.
+ */
+export function normalizeGuideShareUrl(input: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(input.trim());
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+  const path = parsed.pathname.replace(/\/+$/, "");
+  return `${parsed.protocol}//${parsed.host}${path}`;
+}
+
+const warnedInvalidGuideShareUrls = new Set<string>();
+
+/**
+ * Resolve the guide host that guide share links are created on.
+ *
+ * Priority (highest wins):
+ *   PLANNOTATOR_GUIDE_SHARE_URL env var  →  config.guideShareUrl  →  https://guides.show
+ *
+ * An empty (but set) env var counts as unset. A value that is not an http(s)
+ * URL warns once per value on stderr and falls back to the default: a share
+ * setting must never break a server launch or a CLI run. Whether sharing is
+ * allowed at all is a separate question (`resolveSharingEnabled`).
+ */
+export function resolveGuideShareUrl(config: PlannotatorConfig, env: NodeJS.ProcessEnv = process.env): string {
+  const envVal = env.PLANNOTATOR_GUIDE_SHARE_URL;
+  const raw = envVal !== undefined && envVal.trim() !== "" ? envVal : config.guideShareUrl;
+  if (typeof raw !== "string" || raw.trim() === "") return DEFAULT_GUIDE_SHARE_URL;
+  const normalized = normalizeGuideShareUrl(raw);
+  if (normalized) return normalized;
+  if (!warnedInvalidGuideShareUrls.has(raw)) {
+    warnedInvalidGuideShareUrls.add(raw);
+    process.stderr.write(
+      `[plannotator] Warning: invalid guide share URL ${JSON.stringify(raw)} — expected an http(s) URL; using ${DEFAULT_GUIDE_SHARE_URL}\n`,
+    );
+  }
+  return DEFAULT_GUIDE_SHARE_URL;
 }
 
 // Bare hostname or IPv4: letters/digits/dots/hyphens, no leading/trailing

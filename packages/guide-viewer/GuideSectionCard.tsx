@@ -1,9 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown } from 'lucide-react';
-import type { GuideSection } from '@plannotator/shared/guide';
-import type { DiffFile } from '../../types';
-import { renderMarkdownProse } from '../../utils/renderMarkdownProse';
-import { useReviewState } from '../../dock/ReviewStateContext';
+import type { GuideSection } from '@plannotator/core/guide';
+import type { DiffFile } from './types';
+import { renderMarkdownProse } from './renderMarkdownProse';
+import { useGuideHost } from './host';
 import { GuideFileCard } from './GuideFileCard';
 
 function Checkbox({ checked }: { checked: boolean }) {
@@ -42,7 +42,7 @@ function FileChip({
     <button
       type="button"
       onClick={onClick}
-      className={`flex w-full items-center gap-2 rounded-md border px-2.5 py-1.5 text-left transition-colors ${
+      className={`flex w-full items-center gap-2 rounded-md border px-2.5 py-1.5 text-left transition-colors pointer-coarse:py-2.5 ${
         active ? 'border-primary/40 bg-primary/10' : 'border-border/50 bg-background hover:border-border'
       }`}
       title={summary ? `${filePath}\n\n${summary}` : filePath}
@@ -94,12 +94,12 @@ export const GuideSectionCard: React.FC<GuideSectionCardProps> = ({
   onRequestReveal,
 }) => {
   const [collapsedOverride, setCollapsedOverride] = useState<boolean | null>(null);
-  const state = useReviewState();
+  const host = useGuideHost();
   const cardRef = useRef<HTMLDivElement>(null);
   const position = `${String(index + 1).padStart(2, '0')} / ${String(total).padStart(2, '0')}`;
   const isCollapsed = showReviewed ? collapsedOverride ?? reviewed : collapsedOverride === true;
 
-  const filesByPath = useMemo(() => new Map(state.files.map((file) => [file.path, file])), [state.files]);
+  const filesByPath = useMemo(() => new Map(host.files.map((file) => [file.path, file])), [host.files]);
   const summaryByPath = useMemo(() => {
     const summaries = new Map<string, string>();
     for (const ref of section.diffs) {
@@ -136,7 +136,7 @@ export const GuideSectionCard: React.FC<GuideSectionCardProps> = ({
             type="button"
             onClick={handleToggleReviewed}
             aria-label={reviewed ? 'Un-mark as reviewed' : 'Mark as reviewed'}
-            className="flex-shrink-0 rounded"
+            className="flex-shrink-0 rounded relative pointer-coarse:before:absolute pointer-coarse:before:-inset-3.5 pointer-coarse:before:content-['']"
           >
             <Checkbox checked={reviewed} />
           </button>
@@ -161,9 +161,10 @@ export const GuideSectionCard: React.FC<GuideSectionCardProps> = ({
 
   return (
     <div ref={cardRef} className="scroll-mt-4 overflow-clip rounded-lg border border-border/50 bg-card">
-      <div className="md:grid md:grid-cols-[440px_minmax(0,1fr)]">
+      {/* Stacked below md; a proportional chapter column on tablets; the fixed 440px column from lg up (desktop unchanged). */}
+      <div className="md:grid md:grid-cols-[minmax(260px,36%)_minmax(0,1fr)] lg:grid-cols-[440px_minmax(0,1fr)]">
         <div className="border-b border-border/40 md:border-b-0 md:border-r">
-          <div className="px-6 py-5 md:sticky md:top-0 md:flex md:max-h-[calc(100dvh-48px)] md:flex-col md:overflow-y-auto md:overflow-x-hidden">
+          <div className="px-4 py-4 md:sticky md:top-0 md:flex md:max-h-[calc(100dvh-48px)] md:flex-col md:overflow-y-auto md:overflow-x-hidden md:px-6 md:py-5">
             <div className="flex items-start gap-2 md:flex-none">
               <h3 className="flex-1 text-[15px] font-semibold leading-snug text-foreground [text-wrap:balance]">
                 {section.title}
@@ -171,8 +172,9 @@ export const GuideSectionCard: React.FC<GuideSectionCardProps> = ({
               <button
                 type="button"
                 onClick={() => setCollapsedOverride(true)}
-                className="mt-0.5 flex-shrink-0 rounded p-0.5 text-muted-foreground/40 transition-colors hover:text-foreground"
+                className="mt-0.5 flex-shrink-0 rounded p-0.5 text-muted-foreground/40 transition-colors hover:text-foreground relative pointer-coarse:before:absolute pointer-coarse:before:-inset-3.5 pointer-coarse:before:content-['']"
                 title="Collapse section"
+                aria-label="Collapse section"
               >
                 <ChevronDown className="rotate-180" size={13} />
               </button>
@@ -183,7 +185,7 @@ export const GuideSectionCard: React.FC<GuideSectionCardProps> = ({
                 <button
                   type="button"
                   onClick={handleToggleReviewed}
-                  className="flex items-center gap-1.5 text-[11.5px] text-muted-foreground transition-colors hover:text-foreground"
+                  className="flex items-center gap-1.5 text-[11.5px] text-muted-foreground transition-colors hover:text-foreground pointer-coarse:-my-3 pointer-coarse:py-3"
                   title={reviewed ? 'Un-mark as reviewed' : 'Mark as reviewed'}
                 >
                   <Checkbox checked={reviewed} />
@@ -213,7 +215,7 @@ export const GuideSectionCard: React.FC<GuideSectionCardProps> = ({
           </div>
         </div>
 
-        <div className="min-w-0 space-y-4 bg-muted/[0.07] px-4 py-4">
+        <div className="min-w-0 space-y-4 bg-muted/[0.07] px-1.5 py-3 md:px-4 md:py-4">
           {files.length > 0 ? (
             files.map((file) => (
               <GuideFileCard
