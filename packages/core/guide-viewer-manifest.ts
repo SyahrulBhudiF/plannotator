@@ -5,10 +5,10 @@
 import type { GuideViewerAssets } from "./guide-format";
 
 export const GUIDE_VIEWER_MANIFEST: Omit<GuideViewerAssets, "baseUrl"> = {
-  js: "viewer.CpDlIFcA.js",
-  css: "viewer.DgwM0Ujf.css",
-  jsIntegrity: "sha384-AL8vNhcGQZd8DuYJQfpqGrNTVWBusWhMZEyeki9HMOj6ryXhrvqzPj7EuR7DOt9I",
-  cssIntegrity: "sha384-7WoUPritW0qvClDPhC0nVxkMLTziN0ZKhSwJ604m6q4OSqTQ5NV+KuN2cT4d+nAU",
+  js: "viewer.C4G-XTIH.js",
+  css: "viewer.D5C12YTr.css",
+  jsIntegrity: "sha384-4P2327MM9Zs8WDO5AKfa8Rb42GmKmTeJTu5AFGfnCmO5kIOeA7mhxvYrlXwHn0Te",
+  cssIntegrity: "sha384-IipKYSubPTS20Nnoja07qxxoO6J57dq5Gbdq6bxJbr+wsEnNT8HXqLv+CvxhJJD7",
   langs: {
     "astro": "chunks/astro.BykyiR6i.js",
     "c": "chunks/c.BIGW1oBm.js",
