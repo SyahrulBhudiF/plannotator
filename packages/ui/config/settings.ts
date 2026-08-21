@@ -10,6 +10,10 @@
  */
 
 import { parseTypographyConfig, type DiffLineBgIntensity, type TypographyConfig } from '@plannotator/core/config-types';
+import {
+  isAnnotateAgentTerminalSide,
+  type AnnotateAgentTerminalSide,
+} from '@plannotator/core/agent-terminal';
 import { isFaviconStyle, type FaviconStyle } from '@plannotator/core/favicon';
 import { storage } from '../utils/storage';
 import { generateIdentity } from '../utils/generateIdentity';
@@ -564,6 +568,50 @@ export const SETTINGS = {
         return {};
       }
     },
+  },
+  /**
+   * Where the annotate-mode Agent TUI docks: 'left' (where it always docked),
+   * 'right', or 'hidden' (no slot until the user opens it for the session).
+   *
+   * Server-synced so the placement survives the random port every annotate
+   * session runs on — a cookie alone is per-origin, and each invocation is a
+   * new origin, so a cookie-only preference is effectively per-session.
+   *
+   * The cookie key is the pre-registry one, so a user who already picked a
+   * side keeps it across the upgrade.
+   */
+  agentTerminalSide: {
+    defaultValue: 'left' as AnnotateAgentTerminalSide,
+    fromCookie: () => {
+      const v = storage.getItem('plannotator-annotate-agent-terminal-side');
+      return isAnnotateAgentTerminalSide(v) ? v : undefined;
+    },
+    toCookie: (v: AnnotateAgentTerminalSide) =>
+      storage.setItem('plannotator-annotate-agent-terminal-side', v),
+    serverKey: 'agentTerminalSide',
+    fromServer: (sc: Record<string, unknown>) =>
+      isAnnotateAgentTerminalSide(sc.agentTerminalSide) ? sc.agentTerminalSide : undefined,
+    toServer: (v: AnnotateAgentTerminalSide) => ({ agentTerminalSide: v }),
+  },
+  /**
+   * Which agent the annotate-mode Agent TUI preselects. Empty string = no
+   * choice recorded yet, in which case the first available agent wins.
+   * Server-synced for the same reason as the placement above.
+   */
+  agentTerminalDefaultAgent: {
+    defaultValue: '' as string,
+    fromCookie: () =>
+      storage.getItem('plannotator-annotate-agent-terminal-default') || undefined,
+    toCookie: (v: string) => {
+      if (v) storage.setItem('plannotator-annotate-agent-terminal-default', v);
+      else storage.removeItem('plannotator-annotate-agent-terminal-default');
+    },
+    serverKey: 'agentTerminalDefaultAgent',
+    fromServer: (sc: Record<string, unknown>) =>
+      typeof sc.agentTerminalDefaultAgent === 'string' && sc.agentTerminalDefaultAgent
+        ? sc.agentTerminalDefaultAgent
+        : undefined,
+    toServer: (v: string) => ({ agentTerminalDefaultAgent: v }),
   },
   /* SettingDef<any>, not <unknown>: consumers compile this shipped source under
      their own strictFunctionTypes, where a narrow `toCookie: (v: string) => void`

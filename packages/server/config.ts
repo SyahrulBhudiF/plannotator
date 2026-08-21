@@ -9,6 +9,7 @@ export {
   resolveGuideHistory,
   parseReviewAnalysisConfig,
   parseTypographyConfig,
+  isAgentTerminalSide,
   type PlannotatorConfig,
   type DiffOptions,
 } from "@plannotator/shared/config";
