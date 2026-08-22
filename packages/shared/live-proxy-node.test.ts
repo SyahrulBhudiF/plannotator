@@ -1,32 +1,37 @@
 /**
- * Live app proxy contract (phase 1).
+ * Live app proxy contract — Node transport.
  *
- * Boots the real proxy against an in-test fake dev server on 127.0.0.1:0 and
- * asserts the load-bearing behaviors: bridge injection (placement, exactly
- * one, cross-chunk), header hygiene (Host rewrite, Accept-Encoding on
- * document intent only, CSP replacement, frame-ancestors), passthrough
- * fidelity (assets, encoded HTML, SSE, WebSocket), and the security posture
- * (loopback bind, Host validation, reserved namespace).
+ * The same transport-level contract packages/server/live-proxy.test.ts pins
+ * for the Bun transport, run against the node:http implementation the Pi
+ * extension ships: bridge injection (placement, exactly one, cross-chunk),
+ * header hygiene (Host rewrite, Accept-Encoding on document intent only, CSP
+ * replacement, frame-ancestors), passthrough fidelity (assets, encoded HTML,
+ * SSE, WebSocket upgrade piping), and the security posture (loopback bind,
+ * Host-before-parse incl. the Host-less HTTP/1.0 case, WS origin gate,
+ * bridge Sec-Fetch-Site gate, reserved namespace). Pure-decision coverage
+ * (injector state machine, predicates) lives once in the shared core and is
+ * exercised by the Bun suite's unit-helper block; this file guards what the
+ * TRANSPORT can regress.
+ *
+ * The proxy under test runs in a REAL `node` child process
+ * (live-proxy-node.child.ts, built with Bun.build): that is the transport's
+ * production runtime under Pi, and Bun's node:http shim drops writes made to
+ * an 'upgrade' event's socket, which would fail the WS tests against code
+ * that works in production.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { connect } from "node:net";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   LIVE_PROXY_BRIDGE_PATH,
-  createHtmlInjector,
-  isAllowedProxyHost,
-  isAllowedProxyOrigin,
-  isDocumentIntentRequest,
-  isLoopbackHostname,
-  rewriteLoopbackLocation,
-  startLiveAppProxy,
-  type LiveAppProxy,
-} from "./live-proxy";
+} from "./live-proxy-core";
+import { startLiveAppProxyNode } from "./live-proxy-node";
 
 const INJECT_TAG = `<script src="${LIVE_PROXY_BRIDGE_PATH}"></script>`;
-const BRIDGE_BODY = "window.__plannotatorLiveConfig = {\"token\":\"tok-abc123\",\"editorOrigins\":[\"http://localhost:4100\",\"http://127.0.0.1:4100\"]}; /* bridge */";
+const BRIDGE_BODY = "window.__plannotatorLiveConfig = {\"token\":\"tok-node123\",\"editorOrigins\":[\"http://localhost:4100\",\"http://127.0.0.1:4100\"]}; /* bridge */";
 const EDITOR_ORIGINS = ["http://localhost:4100", "http://127.0.0.1:4100"];
 
 const HTML_PAGE = "<!doctype html><html><head><title>Fake App</title><link rel=\"stylesheet\" href=\"/style.css\"></head><body><div id=\"root\">hi</div><script src=\"/asset.js\"></script></body></html>";
@@ -36,15 +41,59 @@ const BINARY_BYTES = new Uint8Array([0, 1, 2, 3, 250, 251, 252, 253, 254, 255]);
 
 let upstreamHits: string[] = [];
 let recordedHeaders: Record<string, string | null> = {};
-let upstream: ReturnType<typeof Bun.serve<{ hits: number }>>;
-let proxy: LiveAppProxy;
+let upstream: ReturnType<typeof Bun.serve<{ hits: number }, object>>;
+let proxy: { port: number; origin: string };
+let proxyChild: ReturnType<typeof Bun.spawn> | null = null;
+let childDir: string | null = null;
 
 function proxyUrl(path: string): string {
   return proxy.origin + path;
 }
 
-beforeAll(() => {
-  upstream = Bun.serve<{ hits: number }>({
+/** Build the child entry for real node and spawn it; resolves the proxy port
+ * from the child's one-line JSON banner. */
+async function spawnNodeProxyChild(targetUrl: string): Promise<{ port: number; origin: string }> {
+  const build = await Bun.build({
+    entrypoints: [join(import.meta.dir, "live-proxy-node.child.ts")],
+    target: "node",
+    format: "esm",
+  });
+  if (!build.success) {
+    throw new Error(`child build failed: ${build.logs.map((l) => l.message).join("; ")}`);
+  }
+  childDir = mkdtempSync(join(tmpdir(), "live-proxy-node-test-"));
+  const entry = join(childDir, "child.mjs");
+  writeFileSync(entry, await build.outputs[0]!.text());
+  proxyChild = Bun.spawn(["node", entry], {
+    env: {
+      ...process.env,
+      LIVE_PROXY_TARGET: targetUrl,
+      LIVE_PROXY_EDITOR_ORIGINS: EDITOR_ORIGINS.join(","),
+      LIVE_PROXY_BRIDGE: BRIDGE_BODY,
+    },
+    stdout: "pipe",
+    stderr: "inherit",
+  });
+  const reader = (proxyChild.stdout as ReadableStream<Uint8Array>).getReader();
+  let banner = "";
+  const timeout = setTimeout(() => reader.cancel().catch(() => {}), 10_000);
+  try {
+    while (!banner.includes("\n")) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      banner += new TextDecoder().decode(value);
+    }
+  } finally {
+    clearTimeout(timeout);
+    reader.releaseLock();
+  }
+  const line = banner.split("\n")[0] ?? "";
+  const parsed = JSON.parse(line) as { port: number };
+  return { port: parsed.port, origin: `http://127.0.0.1:${parsed.port}` };
+}
+
+beforeAll(async () => {
+  upstream = Bun.serve<{ hits: number }, object>({
     hostname: "127.0.0.1",
     port: 0,
     idleTimeout: 0,
@@ -53,6 +102,7 @@ beforeAll(() => {
       upstreamHits.push(url.pathname);
 
       if (url.pathname === "/ws-echo") {
+        recordedHeaders["ws-origin"] = req.headers.get("origin");
         if (srv.upgrade(req, { data: { hits: 0 } })) return;
         return new Response("not ws", { status: 400 });
       }
@@ -80,41 +130,10 @@ beforeAll(() => {
           });
           return new Response(stream, { headers: { "Content-Type": "text/html" } });
         }
-        case "/chunked-head-close": {
-          // No head open tag; splits the stream inside the </head> marker.
-          const parts = ["<html>prefix</he", "ad><body>ok</body></html>"];
-          const stream = new ReadableStream<Uint8Array>({
-            async start(controller) {
-              for (const part of parts) {
-                controller.enqueue(new TextEncoder().encode(part));
-                await Bun.sleep(10);
-              }
-              controller.close();
-            },
-          });
-          return new Response(stream, { headers: { "Content-Type": "text/html" } });
-        }
         case "/banner-comment":
-          // Codegen banner naming <head> inside a comment BEFORE the real
-          // head: injecting into the comment ships a bridge the browser
-          // never executes, and annotation breaks with no warning at all.
           return new Response(BANNER_COMMENT_PAGE, {
             headers: { "Content-Type": "text/html" },
           });
-        case "/chunked-banner-comment": {
-          // The same banner, with the stream split inside the comment.
-          const parts = ["<!-- do not edit <he", "ad> by hand --><html><head><title>c</title></head><body>ok</body></html>"];
-          const stream = new ReadableStream<Uint8Array>({
-            async start(controller) {
-              for (const part of parts) {
-                controller.enqueue(new TextEncoder().encode(part));
-                await Bun.sleep(10);
-              }
-              controller.close();
-            },
-          });
-          return new Response(stream, { headers: { "Content-Type": "text/html" } });
-        }
         case "/uppercase-content-type":
           // Media types are case-insensitive: this is HTML.
           return new Response(HTML_PAGE, {
@@ -126,9 +145,6 @@ beforeAll(() => {
             headers: { "Content-Type": "text/javascript", "X-Asset-Header": "kept" },
           });
         case "/xfo-asset":
-          // Non-HTML response that relies on X-Frame-Options: the proxy only
-          // strips anti-framing where it replaces it (HTML), so this must
-          // pass through with the app's protection intact.
           return new Response("{\"ok\":true}", {
             headers: { "Content-Type": "application/json", "X-Frame-Options": "DENY" },
           });
@@ -176,6 +192,10 @@ beforeAll(() => {
           return new Response("<html><head></head><body>h</body></html>", {
             headers: { "Content-Type": "text/html" },
           });
+        case "/echo-body": {
+          const body = await req.text();
+          return new Response(body, { headers: { "Content-Type": "text/plain" } });
+        }
         case "/redirect":
           return new Response(null, {
             status: 302,
@@ -187,15 +207,11 @@ beforeAll(() => {
             headers: { Location: "/after-redirect" },
           });
         case "/redirect-alt-spelling":
-          // Upstream names its own origin with the OTHER loopback spelling
-          // (target is 127.0.0.1:<port>, Location says localhost:<port>).
           return new Response(null, {
             status: 302,
             headers: { Location: `http://localhost:${srv.port}/after-redirect?x=1` },
           });
         case "/redirect-lookalike":
-          // Another local service whose port merely EXTENDS the target port
-          // as a string prefix (5173 vs 51730): must pass through untouched.
           return new Response(null, {
             status: 302,
             headers: { Location: `http://127.0.0.1:${srv.port}0/auth` },
@@ -212,19 +228,16 @@ beforeAll(() => {
     },
   });
 
-  proxy = startLiveAppProxy({
-    targetUrl: `http://127.0.0.1:${upstream.port}`,
-    editorOrigins: EDITOR_ORIGINS,
-    bridgeJs: BRIDGE_BODY,
-  });
+  proxy = await spawnNodeProxyChild(`http://127.0.0.1:${upstream.port}`);
 });
 
 afterAll(() => {
-  proxy.stop();
+  proxyChild?.kill();
+  if (childDir) rmSync(childDir, { recursive: true, force: true });
   upstream.stop(true);
 });
 
-describe("live proxy: HTML injection", () => {
+describe("node live proxy: HTML injection", () => {
   test("injects exactly one bridge script tag immediately after the head open tag", async () => {
     const html = await (await fetch(proxyUrl("/"))).text();
     expect(html).toContain(INJECT_TAG);
@@ -237,59 +250,32 @@ describe("live proxy: HTML injection", () => {
   test("no head open tag: appends the tag at end of stream", async () => {
     const html = await (await fetch(proxyUrl("/no-head"))).text();
     expect(html.split(INJECT_TAG).length - 1).toBe(1);
-    // No <head> and no </head> in the document: tag lands at the end.
     expect(html).toBe(NO_HEAD_PAGE + INJECT_TAG);
   });
 
-  test("head open tag split across chunks still injects once, after the tag", async () => {
+  test("head open tag split across upstream chunks still injects once, after the tag", async () => {
     const html = await (await fetch(proxyUrl("/chunked-head-open"))).text();
     expect(html.split(INJECT_TAG).length - 1).toBe(1);
     expect(html).toContain(`<head data-x="1">${INJECT_TAG}`);
   });
 
-  test("</head> marker split across chunks injects before it (no head open tag)", async () => {
-    const html = await (await fetch(proxyUrl("/chunked-head-close"))).text();
-    expect(html.split(INJECT_TAG).length - 1).toBe(1);
-    expect(html).toContain(`${INJECT_TAG}</head>`);
-  });
-
   test("a comment naming <head> before the real head does not capture the injection", async () => {
     const html = await (await fetch(proxyUrl("/banner-comment"))).text();
     expect(html.split(INJECT_TAG).length - 1).toBe(1);
-    // The tag lands after the REAL head open tag, not inside the banner.
     expect(html).toContain(`<html><head>${INJECT_TAG}`);
-    expect(html.indexOf(INJECT_TAG)).toBeGreaterThan(html.indexOf("-->"));
     expect(html.replace(INJECT_TAG, "")).toBe(BANNER_COMMENT_PAGE);
-  });
-
-  test("a comment split across chunks is still skipped whole", async () => {
-    const html = await (await fetch(proxyUrl("/chunked-banner-comment"))).text();
-    expect(html.split(INJECT_TAG).length - 1).toBe(1);
-    expect(html).toContain(`<head>${INJECT_TAG}`);
-    expect(html.indexOf(INJECT_TAG)).toBeGreaterThan(html.indexOf("-->"));
   });
 
   test("an uppercase TEXT/HTML content type is still injected and reframed", async () => {
     const res = await fetch(proxyUrl("/uppercase-content-type"));
     const html = await res.text();
     expect(html.split(INJECT_TAG).length - 1).toBe(1);
-    // The framing rewrites ride on the same content-type test.
     expect(res.headers.get("x-frame-options")).toBeNull();
     expect(res.headers.get("content-security-policy")).toContain("frame-ancestors");
   });
-
-  test("content-length is not present (or correct) on injected responses", async () => {
-    const res = await fetch(proxyUrl("/"));
-    const body = await res.text();
-    const contentLength = res.headers.get("content-length");
-    if (contentLength !== null) {
-      expect(Number(contentLength)).toBe(new TextEncoder().encode(body).byteLength);
-    }
-    expect(body).toContain(INJECT_TAG);
-  });
 });
 
-describe("live proxy: header hygiene", () => {
+describe("node live proxy: header hygiene", () => {
   test("upstream sees its own Host, forwarded headers, and no Accept-Encoding on documents", async () => {
     recordedHeaders = {};
     await (await fetch(proxyUrl("/headers"), {
@@ -319,25 +305,17 @@ describe("live proxy: header hygiene", () => {
     expect(await res.text()).toContain(INJECT_TAG);
   });
 
-  test("non-HTML responses keep their headers", async () => {
-    const res = await fetch(proxyUrl("/asset.js"));
-    expect(res.headers.get("x-asset-header")).toBe("kept");
-    expect(res.headers.get("content-security-policy")).toBeNull();
-  });
-
-  test("non-HTML responses keep their X-Frame-Options", async () => {
-    // The anti-framing strip exists only where frame-ancestors replaces it
-    // (HTML). A sniffable-but-not-text/html response must not lose the
-    // clickjacking protection its app shipped.
-    const res = await fetch(proxyUrl("/xfo-asset"));
-    expect(res.headers.get("x-frame-options")).toBe("DENY");
+  test("non-HTML responses keep their headers, CSP-free and with X-Frame-Options intact", async () => {
+    const asset = await fetch(proxyUrl("/asset.js"));
+    expect(asset.headers.get("x-asset-header")).toBe("kept");
+    expect(asset.headers.get("content-security-policy")).toBeNull();
+    const xfo = await fetch(proxyUrl("/xfo-asset"));
+    expect(xfo.headers.get("x-frame-options")).toBe("DENY");
   });
 });
 
-describe("live proxy: passthrough fidelity", () => {
+describe("node live proxy: passthrough fidelity", () => {
   test("content-encoded HTML passes through unmodified (no injection, body intact)", async () => {
-    // A raw socket keeps Bun's fetch from transparently decompressing, so we
-    // can assert the exact bytes the proxy relayed.
     const raw = await rawHttpRequest(proxy.port, [
       "GET /gzip HTTP/1.1",
       `Host: 127.0.0.1:${proxy.port}`,
@@ -348,7 +326,6 @@ describe("live proxy: passthrough fidelity", () => {
     const expected = Bun.gzipSync(new TextEncoder().encode(HTML_PAGE));
     expect(raw.body.byteLength).toBe(expected.byteLength);
     expect(Buffer.from(raw.body).equals(Buffer.from(expected))).toBe(true);
-    // Decoded, it is the original page with no injected tag.
     const decoded = new TextDecoder().decode(Bun.gunzipSync(raw.body));
     expect(decoded).toBe(HTML_PAGE);
     expect(decoded).not.toContain(INJECT_TAG);
@@ -358,6 +335,14 @@ describe("live proxy: passthrough fidelity", () => {
     const res = await fetch(proxyUrl("/binary"));
     const bytes = new Uint8Array(await res.arrayBuffer());
     expect(Buffer.from(bytes).equals(Buffer.from(BINARY_BYTES))).toBe(true);
+  });
+
+  test("request bodies stream upstream (POST echo)", async () => {
+    const res = await fetch(proxyUrl("/echo-body"), {
+      method: "POST",
+      body: "posted-through-proxy",
+    });
+    expect(await res.text()).toBe("posted-through-proxy");
   });
 
   test("SSE: the first event is readable before the stream completes", async () => {
@@ -379,33 +364,24 @@ describe("live proxy: passthrough fidelity", () => {
     expect(rest).toContain("data: second");
   });
 
-  test("redirect Location on the target origin is rewritten to the proxy origin", async () => {
-    const res = await fetch(proxyUrl("/redirect"), { redirect: "manual" });
-    expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe(`${proxy.origin}/after-redirect`);
-  });
+  test("redirect Locations: target-origin rewritten (both spellings), others untouched", async () => {
+    const own = await fetch(proxyUrl("/redirect"), { redirect: "manual" });
+    expect(own.status).toBe(302);
+    expect(own.headers.get("location")).toBe(`${proxy.origin}/after-redirect`);
 
-  test("relative redirect Locations pass through untouched", async () => {
-    const res = await fetch(proxyUrl("/relative-redirect"), { redirect: "manual" });
-    expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe("/after-redirect");
-  });
+    const relative = await fetch(proxyUrl("/relative-redirect"), { redirect: "manual" });
+    expect(relative.headers.get("location")).toBe("/after-redirect");
 
-  test("a Location naming the upstream under its other loopback spelling is rewritten", async () => {
-    const res = await fetch(proxyUrl("/redirect-alt-spelling"), { redirect: "manual" });
-    expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe(`${proxy.origin}/after-redirect?x=1`);
-  });
+    const altSpelling = await fetch(proxyUrl("/redirect-alt-spelling"), { redirect: "manual" });
+    expect(altSpelling.headers.get("location")).toBe(`${proxy.origin}/after-redirect?x=1`);
 
-  test("a Location whose port merely extends the target port passes through untouched", async () => {
-    const res = await fetch(proxyUrl("/redirect-lookalike"), { redirect: "manual" });
-    expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe(`http://127.0.0.1:${upstream.port}0/auth`);
+    const lookalike = await fetch(proxyUrl("/redirect-lookalike"), { redirect: "manual" });
+    expect(lookalike.headers.get("location")).toBe(`http://127.0.0.1:${upstream.port}0/auth`);
   });
 });
 
-describe("live proxy: WebSocket passthrough", () => {
-  test("text and binary frames echo through; early messages are queued", async () => {
+describe("node live proxy: WebSocket passthrough", () => {
+  test("text and binary frames echo through the raw-socket upgrade pipe", async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${proxy.port}/ws-echo`);
     const received: (string | Uint8Array)[] = [];
     const gotBoth = new Promise<void>((resolve, reject) => {
@@ -429,13 +405,11 @@ describe("live proxy: WebSocket passthrough", () => {
       });
     });
     ws.addEventListener("open", () => {
-      // Sent immediately on client open: the upstream socket may not be
-      // connected yet, exercising the pending queue.
-      ws.send("hello-through-proxy");
+      ws.send("hello-through-node-proxy");
       ws.send(new Uint8Array([9, 8, 7]));
     });
     await gotBoth;
-    expect(received[0]).toBe("hello-through-proxy");
+    expect(received[0]).toBe("hello-through-node-proxy");
     expect(Buffer.from(received[1] as Uint8Array).equals(Buffer.from([9, 8, 7]))).toBe(true);
     const closed = new Promise<void>((resolve) => ws.addEventListener("close", () => resolve()));
     ws.close();
@@ -443,8 +417,6 @@ describe("live proxy: WebSocket passthrough", () => {
   });
 
   test("a WS upgrade with a foreign Origin is refused before touching upstream", async () => {
-    // A hostile page's cross-site connect must not be laundered into the
-    // origin-less shape dev servers trust as a non-browser client.
     upstreamHits = [];
     const raw = await rawHttpRequest(proxy.port, [
       "GET /ws-echo HTTP/1.1",
@@ -459,7 +431,8 @@ describe("live proxy: WebSocket passthrough", () => {
     expect(upstreamHits).toEqual([]);
   });
 
-  test("a WS upgrade with the proxy's own Origin still echoes through", async () => {
+  test("a WS upgrade with the proxy's own Origin echoes through, arriving upstream origin-less", async () => {
+    recordedHeaders = {};
     const ws = new WebSocket(`ws://127.0.0.1:${proxy.port}/ws-echo`, {
       headers: { origin: `http://127.0.0.1:${proxy.port}` },
     } as unknown as string[]);
@@ -476,13 +449,16 @@ describe("live proxy: WebSocket passthrough", () => {
       ws.addEventListener("open", () => ws.send("origin-ok"));
     });
     expect(echoed).toBe("origin-ok");
+    // The upstream connect must be origin-less (the gated, non-browser shape
+    // the Bun transport's fresh WebSocket also produces).
+    expect(recordedHeaders["ws-origin"]).toBeNull();
     const closed = new Promise<void>((resolve) => ws.addEventListener("close", () => resolve()));
     ws.close();
     await closed;
   });
 });
 
-describe("live proxy: security posture", () => {
+describe("node live proxy: security posture", () => {
   test("a non-localhost Host header gets 403 and never touches upstream", async () => {
     upstreamHits = [];
     const raw = await rawHttpRequest(proxy.port, [
@@ -495,10 +471,6 @@ describe("live proxy: security posture", () => {
   });
 
   test("a Host-less HTTP/1.0 request gets the plain 403, never a runtime error page", async () => {
-    // With no Host header req.url is a bare "/", so constructing a URL from it
-    // throws. Doing that before the Host check served Bun's internal debug
-    // page (tens of KB, with a stack trace) from a port whose entire contract
-    // is refusing requests that do not name it.
     upstreamHits = [];
     const raw = await rawHttpRequest(proxy.port, ["GET / HTTP/1.0"]);
     expect(raw.head.startsWith("http/1.0 403") || raw.head.startsWith("http/1.1 403")).toBe(true);
@@ -512,19 +484,10 @@ describe("live proxy: security posture", () => {
     expect(proxy.origin).toBe(`http://127.0.0.1:${proxy.port}`);
     // The bind is a source-level contract: the literal loopback constant,
     // never getServerHostname() or any env-dependent interface.
-    const source = readFileSync(join(import.meta.dir, "live-proxy.ts"), "utf-8");
+    const source = readFileSync(join(import.meta.dir, "live-proxy-node.ts"), "utf-8");
     expect(source).toContain('const LOOPBACK_HOST = "127.0.0.1";');
-    expect(source).toContain("hostname: LOOPBACK_HOST");
+    expect(source).toContain("server.listen(0, LOOPBACK_HOST");
     expect(source).not.toContain("getServerHostname");
-  });
-
-  test("host validation accepts only this proxy's loopback names", () => {
-    expect(isAllowedProxyHost(`127.0.0.1:${proxy.port}`, proxy.port)).toBe(true);
-    expect(isAllowedProxyHost(`localhost:${proxy.port}`, proxy.port)).toBe(true);
-    expect(isAllowedProxyHost(`[::1]:${proxy.port}`, proxy.port)).toBe(true);
-    expect(isAllowedProxyHost(`127.0.0.1:${proxy.port + 1}`, proxy.port)).toBe(false);
-    expect(isAllowedProxyHost("evil.example", proxy.port)).toBe(false);
-    expect(isAllowedProxyHost(null, proxy.port)).toBe(false);
   });
 
   test("the bridge body is served from the reserved path with no-store", async () => {
@@ -533,8 +496,7 @@ describe("live proxy: security posture", () => {
     expect(res.headers.get("cache-control")).toBe("no-store");
     const body = await res.text();
     expect(body).toBe(BRIDGE_BODY);
-    expect(body).toContain("tok-abc123");
-    expect(body).toContain("http://localhost:4100");
+    expect(body).toContain("tok-node123");
   });
 
   test("other reserved paths are 404 and never forwarded upstream", async () => {
@@ -544,20 +506,29 @@ describe("live proxy: security posture", () => {
     expect(upstreamHits).toEqual([]);
   });
 
+  test("stop() releases the listener port", async () => {
+    // In-process (listener lifecycle only — no upgrade socket involved, so
+    // the Bun shim is faithful here): stop must close the listening socket.
+    const local = await startLiveAppProxyNode({
+      targetUrl: `http://127.0.0.1:${upstream.port}`,
+      editorOrigins: EDITOR_ORIGINS,
+      bridgeJs: BRIDGE_BODY,
+    });
+    const before = await fetch(`${local.origin}${LIVE_PROXY_BRIDGE_PATH}`);
+    expect(before.status).toBe(200);
+    local.stop();
+    await expect(fetch(`${local.origin}${LIVE_PROXY_BRIDGE_PATH}`)).rejects.toBeDefined();
+  });
+
   test("bridge.js refuses cross-site and same-site subresource fetches (token exposure)", async () => {
-    // A hostile page that guesses the port must not read the token via an
-    // off-origin <script src> include; browsers stamp those cross-site.
     const crossSite = await fetch(proxyUrl(LIVE_PROXY_BRIDGE_PATH), {
       headers: { "sec-fetch-site": "cross-site" },
     });
     expect(crossSite.status).toBe(403);
-    // Another localhost port's page is same-SITE but not same-origin.
     const sameSite = await fetch(proxyUrl(LIVE_PROXY_BRIDGE_PATH), {
       headers: { "sec-fetch-site": "same-site" },
     });
     expect(sameSite.status).toBe(403);
-    // The proxied page's own include is same-origin; direct navigation is
-    // none; header-less clients pass.
     const sameOrigin = await fetch(proxyUrl(LIVE_PROXY_BRIDGE_PATH), {
       headers: { "sec-fetch-site": "same-origin" },
     });
@@ -568,170 +539,6 @@ describe("live proxy: security posture", () => {
     expect(navigation.status).toBe(200);
   });
 });
-
-describe("live proxy: unit helpers", () => {
-  test("isDocumentIntentRequest keys on Sec-Fetch-Dest or an HTML Accept", () => {
-    expect(isDocumentIntentRequest(new Headers({ "sec-fetch-dest": "document" }))).toBe(true);
-    expect(isDocumentIntentRequest(new Headers({ "sec-fetch-dest": "iframe" }))).toBe(true);
-    expect(isDocumentIntentRequest(new Headers({ "sec-fetch-dest": "frame" }))).toBe(true);
-    expect(isDocumentIntentRequest(new Headers({ accept: "text/html,*/*" }))).toBe(true);
-    expect(isDocumentIntentRequest(new Headers({ "sec-fetch-dest": "script", accept: "*/*" }))).toBe(false);
-    expect(isDocumentIntentRequest(new Headers())).toBe(false);
-  });
-
-  test("createHtmlInjector never double-injects when both markers appear", () => {
-    const injector = createHtmlInjector("<INJ>");
-    const out: string[] = [];
-    const decoder = new TextDecoder();
-    for (const chunk of ["<html><head>", "<title>t</title></head><body></body></html>"]) {
-      for (const part of injector.push(new TextEncoder().encode(chunk))) {
-        out.push(decoder.decode(part));
-      }
-    }
-    for (const part of injector.flush()) out.push(decoder.decode(part));
-    const html = out.join("");
-    expect(html.split("<INJ>").length - 1).toBe(1);
-    expect(html).toContain("<head><INJ>");
-  });
-
-  test("isLoopbackHostname requires literal 127/8 IPv4, never a string prefix", () => {
-    expect(isLoopbackHostname("localhost")).toBe(true);
-    expect(isLoopbackHostname("LOCALHOST")).toBe(true);
-    expect(isLoopbackHostname("::1")).toBe(true);
-    expect(isLoopbackHostname("[::1]")).toBe(true);
-    expect(isLoopbackHostname("127.0.0.1")).toBe(true);
-    expect(isLoopbackHostname("127.255.255.255")).toBe(true);
-    expect(isLoopbackHostname("127.0.0.1.evil.example")).toBe(false);
-    expect(isLoopbackHostname("127.evil.example")).toBe(false);
-    expect(isLoopbackHostname("127.0.0")).toBe(false);
-    expect(isLoopbackHostname("127.0.0.256")).toBe(false);
-    expect(isLoopbackHostname("128.0.0.1")).toBe(false);
-    expect(isLoopbackHostname("localhost.evil.example")).toBe(false);
-  });
-
-  test("isAllowedProxyOrigin accepts only this proxy's own loopback origins", () => {
-    expect(isAllowedProxyOrigin("http://127.0.0.1:5000", 5000)).toBe(true);
-    expect(isAllowedProxyOrigin("http://localhost:5000", 5000)).toBe(true);
-    expect(isAllowedProxyOrigin("http://[::1]:5000", 5000)).toBe(true);
-    expect(isAllowedProxyOrigin("http://127.0.0.1:5001", 5000)).toBe(false);
-    expect(isAllowedProxyOrigin("https://evil.example", 5000)).toBe(false);
-    expect(isAllowedProxyOrigin("null", 5000)).toBe(false);
-  });
-
-  test("rewriteLoopbackLocation matches by loopback host + port, with boundaries", () => {
-    const target = new URL("http://localhost:5173");
-    const proxyOrigin = "http://127.0.0.1:9000";
-    // Same server, either spelling, boundary respected.
-    expect(rewriteLoopbackLocation("http://localhost:5173/a?b#c", target, proxyOrigin))
-      .toBe("http://127.0.0.1:9000/a?b#c");
-    expect(rewriteLoopbackLocation("http://127.0.0.1:5173/x", target, proxyOrigin))
-      .toBe("http://127.0.0.1:9000/x");
-    expect(rewriteLoopbackLocation("http://localhost:5173", target, proxyOrigin))
-      .toBe("http://127.0.0.1:9000/");
-    // Prefix look-alike port, other ports, other hosts, https, relative: untouched.
-    expect(rewriteLoopbackLocation("http://localhost:51730/auth", target, proxyOrigin)).toBeNull();
-    expect(rewriteLoopbackLocation("http://localhost:3000/", target, proxyOrigin)).toBeNull();
-    expect(rewriteLoopbackLocation("http://evil.example:5173/", target, proxyOrigin)).toBeNull();
-    expect(rewriteLoopbackLocation("https://localhost:5173/", target, proxyOrigin)).toBeNull();
-    expect(rewriteLoopbackLocation("/relative", target, proxyOrigin)).toBeNull();
-  });
-
-  test("createHtmlInjector ignores head markers inside comments and declarations", () => {
-    // Each input pairs a decoy in an ignored span with the real head, so a
-    // scanner that is not span-aware injects into bytes the browser drops.
-    const cases: { html: string; expected: string }[] = [
-      // Comment before the real head open tag (the reported codegen banner).
-      {
-        html: "<!-- do not edit <head> --><html><head><title>t</title></head></html>",
-        expected: "<!-- do not edit <head> --><html><head><INJ><title>t</title></head></html>",
-      },
-      // Decoy </head> in a comment, real </head> with no head open tag.
-      {
-        html: "<html><!-- </head> --><body>x</body></head></html>",
-        expected: "<html><!-- </head> --><body>x</body><INJ></head></html>",
-      },
-      // Legacy --!> comment terminator.
-      {
-        html: "<!-- <head> --!><html><head>a</head></html>",
-        expected: "<!-- <head> --!><html><head><INJ>a</head></html>",
-      },
-      // Bogus comment / CDATA-ish: the HTML parser ends it at the first '>',
-      // which is the one inside the decoy, so the decoy is hidden either way.
-      {
-        html: "<![CDATA[<head>]]><html><head>a</head></html>",
-        expected: "<![CDATA[<head>]]><html><head><INJ>a</head></html>",
-      },
-      // Consecutive comments, and a comment AFTER the injection point is
-      // simply passed through.
-      {
-        html: "<!--a--><!--<head>--><head x><!--<head>--></head>",
-        expected: "<!--a--><!--<head>--><head x><INJ><!--<head>--></head>",
-      },
-    ];
-    for (const { html, expected } of cases) {
-      expect(runInjector(html, [html.length])).toBe(expected);
-    }
-  });
-
-  test("createHtmlInjector: comments survive every chunk boundary", () => {
-    // The scanner holds back a fixed tail across chunks, so every split point
-    // through a comment open, its body, its terminator and the head marker
-    // after it must produce the identical single injection.
-    const html = "<!doctype html><!-- gen: keep <head> as is --><html><head lang=\"en\"><title>t</title></head><body>b</body></html>";
-    const expected = html.replace("<head lang=\"en\">", "<head lang=\"en\"><INJ>");
-    for (let split = 0; split <= html.length; split++) {
-      expect(runInjector(html, [split, html.length])).toBe(expected);
-    }
-    // And byte-at-a-time, the worst case for a holdback-based scanner.
-    expect(runInjector(html, html.split("").map((_, i) => i + 1))).toBe(expected);
-  });
-
-  test("createHtmlInjector falls back to appending when a comment never closes", () => {
-    // Degenerate input: an unterminated comment swallows the rest of the
-    // document, so there is no live injection point left. Appending keeps the
-    // existing no-marker behavior rather than dropping the bridge silently.
-    const html = "<html><!-- oops <head><body>x</body></html>";
-    expect(runInjector(html, [html.length])).toBe(html + "<INJ>");
-  });
-
-  test("createHtmlInjector does not treat <header> as a head open tag", () => {
-    const injector = createHtmlInjector("<INJ>");
-    const out: string[] = [];
-    const decoder = new TextDecoder();
-    for (const part of injector.push(new TextEncoder().encode("<html><body><header>x</header></body></html>"))) {
-      out.push(decoder.decode(part));
-    }
-    for (const part of injector.flush()) out.push(decoder.decode(part));
-    const html = out.join("");
-    expect(html).toBe("<html><body><header>x</header></body></html><INJ>");
-  });
-});
-
-/**
- * Feed `html` through a fresh injector, cut at the given cumulative byte
- * offsets, and return the reassembled output. Concatenating before decoding
- * matters: a cut can land inside a multi-byte character.
- */
-function runInjector(html: string, cuts: number[]): string {
-  const injector = createHtmlInjector("<INJ>");
-  const bytes = new TextEncoder().encode(html);
-  const out: Uint8Array[] = [];
-  let prev = 0;
-  for (const cut of cuts) {
-    const end = Math.min(cut, bytes.length);
-    if (end > prev) out.push(...injector.push(bytes.subarray(prev, end)));
-    prev = end;
-  }
-  if (prev < bytes.length) out.push(...injector.push(bytes.subarray(prev)));
-  out.push(...injector.flush());
-  const merged = new Uint8Array(out.reduce((n, p) => n + p.length, 0));
-  let cursor = 0;
-  for (const part of out) {
-    merged.set(part, cursor);
-    cursor += part.length;
-  }
-  return new TextDecoder().decode(merged);
-}
 
 /** Minimal raw HTTP/1.1 client: needed to send a forged Host header and to
  * observe exact relayed bytes without fetch's transparent decompression. */
@@ -746,8 +553,6 @@ function rawHttpRequest(
     const chunks: Buffer[] = [];
     socket.on("data", (chunk) => {
       chunks.push(chunk);
-      // Proactively close once a content-length body is complete: Bun keeps
-      // the connection alive even when the client sent Connection: close.
       const all = Buffer.concat(chunks);
       const split = all.indexOf("\r\n\r\n");
       if (split === -1) return;
@@ -766,8 +571,6 @@ function rawHttpRequest(
       }
       const head = all.subarray(0, split).toString("utf-8").toLowerCase();
       let body = new Uint8Array(all.subarray(split + 4));
-      // Undo chunked transfer encoding when present so byte assertions see
-      // the payload itself.
       if (head.includes("transfer-encoding: chunked")) {
         body = decodeChunked(body);
       }
